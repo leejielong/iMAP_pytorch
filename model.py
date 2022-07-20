@@ -68,12 +68,12 @@ class Camera():
         self.rgb = torch.from_numpy((rgb).astype(np.float32)).cuda()*(1.0/256)
         self.depth = torch.from_numpy(depth.astype(np.float32)).cuda()*self.factor
     # Calc Transform from camera parameters
-    def update_transform(self):
-        i = torch.cuda.FloatTensor(3,3).fill_(0)
+    def update_transform(self): # create extrinsic matrices from camera parameters
+        i = torch.cuda.FloatTensor(3,3).fill_(0) #identity
         i[0,0] = 1
         i[1,1] = 1
         i[2,2] = 1
-        w1 = torch.cuda.FloatTensor(3,3).fill_(0)
+        w1 = torch.cuda.FloatTensor(3,3).fill_(0) 
         w1[1, 2] = -1
         w1[2, 1] = 1
         w2 = torch.cuda.FloatTensor(3,3).fill_(0)
@@ -83,17 +83,17 @@ class Camera():
         w3[0, 1] = -1
         w3[1, 0] = 1
 
-        th = torch.norm(self.params[0:3])
-        thi = 1.0/(th+1e-12)
-        n = thi * self.params[0:3]
+        th = torch.norm(self.params[0:3]) #get rx ry rz
+        thi = 1.0/(th+1e-12) # 1/theta
+        n = thi * self.params[0:3] # directional vector of rx ry rz
         c = torch.cos(th)
         s = torch.sin(th)
         w = n[0]*w1 + n[1]*w2 + n[2]*w3
         ww = torch.matmul(w,w)
         R1 = i + s * w 
-        self.R = R1 + (1.0-c)*ww
-        self.T = self.params[3:6]
-        self.exp_a = torch.exp(self.params[6])
+        self.R = R1 + (1.0-c)*ww # rotation matrix
+        self.T = self.params[3:6] # translation vector
+        self.exp_a = torch.exp(self.params[6]) #some scaler
 
     def rays_batch(self, u, v):
         batch_size = u.shape[0]
@@ -138,13 +138,13 @@ def sample_pdf(bins, weights, N_samples):
 
 class Mapper():
     def __init__(self):
-        self.model = IMAP().cuda()
-        self.model_tracking = IMAP().cuda()
+        self.model = IMAP().cuda() # v1 of imap 
+        self.model_tracking = IMAP().cuda() # v2 of imap
         self.cameras = []
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.005)
         self.render_id=0
     def updateModelForTracking(self):
-        self.model_tracking.load_state_dict(copy.deepcopy(self.model.state_dict()))
+        self.model_tracking.load_state_dict(copy.deepcopy(self.model.state_dict())) # load latest mapper net weights into tracker net
     def addCamera(self, rgb_filename, depth_filename, px,py,pz,rx,ry,rz, a, b):
         rgb = cv2.imread(rgb_filename, cv2.IMREAD_COLOR)
         depth = cv2.imread(depth_filename, cv2.IMREAD_ANYDEPTH)
@@ -266,22 +266,25 @@ class Mapper():
             cv2.waitKey(1)
     # Mapping step
     def mapping(self, batch_size = 200, activeSampling=True):
-        if len(self.cameras)<5:
+        if len(self.cameras)<5: # if less than 5 cameras, id cameras as 1,2,3,4,5
             camera_ids = np.arange(len(self.cameras))
         else:
             camera_ids = np.random.randint(0,len(self.cameras)-2,5)
             camera_ids[3] = len(self.cameras)-1
             camera_ids[4] = len(self.cameras)-2
+            # randomly select 5 cameras from N available cameras
+            # set last 2 camera ids as last 2 frames.
+            # so we get 3 random frames, 2 latest frames. window size maintained at 5. 
         
-        for camera_id in camera_ids:
+        for camera_id in camera_ids: #loop thru all selected cameras
             self.optimizer.zero_grad()
             self.cameras[camera_id].optimizer.zero_grad()
-            self.cameras[camera_id].update_transform()
+            self.cameras[camera_id].update_transform() # create extrinsic matrices for camera
 
+            h = self.cameras[camera_id].size[0] #rgbd image height
+            w = self.cameras[camera_id].size[1] #rgbd image width
 
-            h = self.cameras[camera_id].size[0]
-            w = self.cameras[camera_id].size[1]
-            # ActiveSampling
+            # ActiveSampling # to select which pixels to sample in camera image
             if activeSampling:
                 with torch.no_grad():
                     sh = int(h/8)
@@ -298,27 +301,33 @@ class Mapper():
                         vl.append((torch.rand(ni)*(sh-1)).to(torch.int16).cuda() + int(i/8)*sh)
                     us = torch.cat(ul)#(torch.rand(batch_size)*(w-1)).to(torch.int16).cuda()
                     vs = torch.cat(vl)#(torch.rand(batch_size)*(h-1)).to(torch.int16).cuda()
-            else:
+            else: # randomly select N pixels in image
                 us = (torch.rand(batch_size)*(w-1)).to(torch.int16).cuda()
                 vs = (torch.rand(batch_size)*(h-1)).to(torch.int16).cuda()
-            depth, rgb, depth_var = self.render_rays(us, vs, self.cameras[camera_id])
+            
+            # us and vs are the pixel sample points in camera image
+            depth, rgb, depth_var = self.render_rays(us, vs, self.cameras[camera_id]) 
+
+            # take gt from captured images
             rgb_gt = torch.cat([self.cameras[camera_id].rgb[v, u, :].unsqueeze(0) for u, v in zip(us, vs)])
             depth_gt = torch.cat([self.cameras[camera_id].depth[v, u].unsqueeze(0) for u, v in zip(us, vs)])
             depth[depth_gt==0]=0
             with torch.no_grad():
-                ivar = torch.reciprocal(torch.sqrt(depth_var))
+                ivar = torch.reciprocal(torch.sqrt(depth_var)) # inverse depth variance
                 ivar[ivar.isinf()]=1
                 ivar[ivar.isnan()]=1
-            lg = torch.mean(torch.abs(depth-depth_gt)*ivar)
-            lp = 5*torch.mean(torch.abs(rgb-rgb_gt))
+            lg = torch.mean(torch.abs(depth-depth_gt)*ivar) #geometric loss
+            lp = 5*torch.mean(torch.abs(rgb-rgb_gt)) #photometric loss
 
-            
+            # propagate loss
             loss = lg+lp
             loss.backward()#retain_graph=True)
             self.optimizer.step()
             #print(lg.detach().cpu(), lp.detach().cpu())
+
             if camera_id > 0:
-                self.cameras[camera_id].optimizer.step()
+                self.cameras[camera_id].optimizer.step() # update camera pose if is not first camera
+                # this is the bundle adjustment part
 
             # Update ActiveSampling
             if activeSampling:
@@ -333,10 +342,10 @@ class Mapper():
                     self.cameras[camera_id].Li = LiS * Li
     # Tracking step
     def track(self, camera, batch_size = 200):
-        self.updateModelForTracking()
-        for iter in range(20):
+        self.updateModelForTracking() # # load latest mapper net weights into tracker net
+        for iter in range(20): # loop up to 20 times for each new camera to learn it
             camera.optimizer.zero_grad()
-            camera.update_transform()
+            camera.update_transform() # use current self.params to update self.R and self.T transformations
             h = camera.size[0]
             w = camera.size[1]
             us = (torch.rand(batch_size)*(w-1)).to(torch.int16).cuda()
@@ -352,10 +361,11 @@ class Mapper():
             lg = torch.mean(torch.abs(depth-depth_gt)*ivar)
             lp = 5*torch.mean(torch.abs(rgb-rgb_gt))
             loss = lg+lp
-            loss.backward()
-            camera.optimizer.step()
+            loss.backward() # apply geometric and photometric loss again, but this time mapping model is frozen,
+            # only the camera pose parameters (self.param) are optimized. The updated params are saved with the camera.
+            camera.optimizer.step() # we actually optimize self.params
             p = float(torch.sum(((torch.abs(depth - depth_gt) * torch.reciprocal(depth_gt+1e-12)) < 0.1).int()).cpu().item()) /batch_size
-            if p>0.8:
+            if p>0.8: # leave loop early if the reconstruction accuracy surpasses 80%
                 break
         print("Tracking: P=", p)
         #del camera.optimizer
